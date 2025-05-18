@@ -460,7 +460,7 @@ def create_instances_from_document_train(
         tokens=tokens,
         masked_lm_positions=masked_lm_positions,
         masked_lm_labels=masked_lm_labels)
-    print(f"      [{time.strftime('%Y-%m-%d %H:%M:%S')}] DOC_TRAIN: User {user}, Step {step_for_log+1}, Doc {doc_index} - END, instances: {len(instances)}")
+    print(f"      [{time.strftime('%Y-%m-%d %H:%M:%S')}] DOC_TRAIN: User {user}, Step {step_for_log+1}, Doc {doc_index} - END, instances: 1")
     return [instance]
 
 
