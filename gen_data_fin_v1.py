@@ -649,11 +649,18 @@ def main():
         print("error dataset_name, uses beauty by default")
         data_file = FLAGS.data_dir + 'beauty.txt'
 
-    output_filename = FLAGS.data_dir + FLAGS.dataset_name + "_" + FLAGS.signature + ".train.tfrecord"
-    vocab_file = FLAGS.data_dir + FLAGS.dataset_name + "_" + FLAGS.signature + ".vocab"
-    user_history_file = FLAGS.data_dir + FLAGS.dataset_name + "_" + FLAGS.signature + ".history"
+    # Construct filenames by directly appending signature (assumed to start with '-') to dataset_name
+    output_filename_base = FLAGS.data_dir + FLAGS.dataset_name + FLAGS.signature 
+    train_output_filename = output_filename_base + ".train.tfrecord"
+    test_output_filename = output_filename_base + ".test.tfrecord"
+    vocab_file = output_filename_base + ".vocab"
+    user_history_file = output_filename_base + ".history"
 
-    print("output_filename", output_filename)
+    # Previous version (added its own hyphen):
+    # output_filename_base = FLAGS.data_dir + FLAGS.dataset_name + "-" + FLAGS.signature
+
+    print("train_output_filename", train_output_filename)
+    print("test_output_filename", test_output_filename)
     print("vocab_file", vocab_file)
     print("user_history_file", user_history_file)
 
@@ -711,7 +718,7 @@ def main():
     # for train
     gen_samples(
         data,
-        output_filename,
+        train_output_filename, # Use the correctly constructed train filename
         rng,
         vocab,
         max_seq_length=FLAGS.max_seq_length,
@@ -726,10 +733,10 @@ def main():
     print("train finish")
 
     # for test
-    output_filename = FLAGS.data_dir + FLAGS.dataset_name + "_" + FLAGS.signature + ".test.tfrecord"
+    # output_filename = FLAGS.data_dir + FLAGS.dataset_name + "_" + FLAGS.signature + ".test.tfrecord"
     gen_samples(
         data,
-        output_filename,
+        test_output_filename, # Use the correctly constructed test filename
         rng,
         vocab,
         max_seq_length=FLAGS.max_seq_length,

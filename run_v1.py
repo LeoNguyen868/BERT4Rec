@@ -19,10 +19,14 @@ from __future__ import division
 from __future__ import print_function
 
 import os
+# Suppress TensorFlow INFO and WARNING messages; show only ERRORS
+# Also, explicitly tell TensorFlow not to use the GPU if CUDA is problematic
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' 
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+
 import modeling
 import optimization_v1 as optimization
 import tensorflow as tf
-import tensorflow.compat.v1.estimator as estimator_v1
 import numpy as np
 import sys
 import pickle
@@ -120,296 +124,55 @@ flags.DEFINE_string("vocab_filename", None, "vocab filename")
 flags.DEFINE_string("user_history_filename", None, "user history filename")
 
 
-
-class EvalHooks(tf.compat.v1.train.SessionRunHook):
-    def __init__(self):
-        tf.compat.v1.logging.info('run init')
-
-    def begin(self):
-        self.valid_user = 0.0
-
-        self.ndcg_1 = 0.0
-        self.hit_1 = 0.0
-        self.ndcg_5 = 0.0
-        self.hit_5 = 0.0
-        self.ndcg_10 = 0.0
-        self.hit_10 = 0.0
-        self.ap = 0.0
-
-        np.random.seed(12345)
-
-        self.vocab = None
-
-        if FLAGS.user_history_filename is not None:
-            print('load user history from :' + FLAGS.user_history_filename)
-            with open(FLAGS.user_history_filename, 'rb') as input_file:
-                self.user_history = pickle.load(input_file)
-
-        if FLAGS.vocab_filename is not None:
-            print('load vocab from :' + FLAGS.vocab_filename)
-            with open(FLAGS.vocab_filename, 'rb') as input_file:
-                self.vocab = pickle.load(input_file)
-
-            keys = self.vocab.counter.keys()
-            values = self.vocab.counter.values()
-            self.ids = self.vocab.convert_tokens_to_ids(keys)
-            # normalize
-            # print(values)
-            sum_value = np.sum([x for x in values])
-            # print(sum_value)
-            self.probability = [value / sum_value for value in values]
-
-    def end(self, session):
-        print(
-            "ndcg@1:{}, hit@1:{}， ndcg@5:{}, hit@5:{}, ndcg@10:{}, hit@10:{}, ap:{}, valid_user:{}".
-            format(self.ndcg_1 / self.valid_user, self.hit_1 / self.valid_user,
-                   self.ndcg_5 / self.valid_user, self.hit_5 / self.valid_user,
-                   self.ndcg_10 / self.valid_user,
-                   self.hit_10 / self.valid_user, self.ap / self.valid_user,
-                   self.valid_user))
-
-    def before_run(self, run_context):
-        #tf.logging.info('run before run')
-        #print('run before_run')
-        variables = tf.get_collection('eval_sp')
-        return tf.train.SessionRunArgs(variables)
-
-    def after_run(self, run_context, run_values):
-        #tf.logging.info('run after run')
-        #print('run after run')
-        masked_lm_log_probs, input_ids, masked_lm_ids, info = run_values.results
-        masked_lm_log_probs = masked_lm_log_probs.reshape(
-            (-1, FLAGS.max_predictions_per_seq, masked_lm_log_probs.shape[1]))
-#         print("loss value:", masked_lm_log_probs.shape, input_ids.shape,
-#               masked_lm_ids.shape, info.shape)
-
-        for idx in range(len(input_ids)):
-            rated = set(input_ids[idx])
-            rated.add(0)
-            rated.add(masked_lm_ids[idx][0])
-            map(lambda x: rated.add(x),
-                self.user_history["user_" + str(info[idx][0])][0])
-            item_idx = [masked_lm_ids[idx][0]]
-            # here we need more consideration
-            masked_lm_log_probs_elem = masked_lm_log_probs[idx, 0]  
-            size_of_prob = len(self.ids) + 1  # len(masked_lm_log_probs_elem)
-            if FLAGS.use_pop_random:
-                if self.vocab is not None:
-                    while len(item_idx) < 101:
-                        sampled_ids = np.random.choice(self.ids, 101, replace=False, p=self.probability)
-                        sampled_ids = [x for x in sampled_ids if x not in rated and x not in item_idx]
-                        item_idx.extend(sampled_ids[:])
-                    item_idx = item_idx[:101]
-            else:
-                # print("evaluation random -> ")
-                for _ in range(100):
-                    t = np.random.randint(1, size_of_prob)
-                    while t in rated:
-                        t = np.random.randint(1, size_of_prob)
-                    item_idx.append(t)
-
-            predictions = -masked_lm_log_probs_elem[item_idx]
-            rank = predictions.argsort().argsort()[0]
-
-            self.valid_user += 1
-
-            if self.valid_user % 100 == 0:
-                print('.', end='')
-                sys.stdout.flush()
-
-            if rank < 1:
-                self.ndcg_1 += 1
-                self.hit_1 += 1
-            if rank < 5:
-                self.ndcg_5 += 1 / np.log2(rank + 2)
-                self.hit_5 += 1
-            if rank < 10:
-                self.ndcg_10 += 1 / np.log2(rank + 2)
-                self.hit_10 += 1
-
-            self.ap += 1.0 / (rank + 1)
-
-
-def model_fn_builder(bert_config, init_checkpoint, learning_rate,
-                     num_train_steps, num_warmup_steps, use_tpu,
-                     use_one_hot_embeddings, item_size):
-    """Returns `model_fn` closure for TPUEstimator."""
-
-    def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
-        """The `model_fn` for TPUEstimator."""
-
-        tf.compat.v1.logging.info("*** Features ***")
-        for name in sorted(features.keys()):
-            tf.compat.v1.logging.info("  name = %s, shape = %s" % (name,
-                                                         features[name].shape))
-
-        info = features["info"]
-        input_ids = features["input_ids"]
-        input_mask = features["input_mask"]
-        masked_lm_positions = features["masked_lm_positions"]
-        masked_lm_ids = features["masked_lm_ids"]
-        masked_lm_weights = features["masked_lm_weights"]
-
-        is_training = (mode == tf.estimator.ModeKeys.TRAIN)
-
-        model = modeling.BertModel(
-            config=bert_config,
-            is_training=is_training,
-            input_ids=input_ids,
-            input_mask=input_mask,
-            use_one_hot_embeddings=use_one_hot_embeddings)
-
-        (masked_lm_loss, masked_lm_example_loss,
-         masked_lm_log_probs) = get_masked_lm_output(
-             bert_config, model.get_sequence_output(), model.get_embedding_table(),
-             masked_lm_positions, masked_lm_ids, masked_lm_weights)
-
-        total_loss = masked_lm_loss
-
-        tvars = tf.trainable_variables()
-        initialized_variable_names = {}
-        scaffold_fn = None
-        if init_checkpoint:
-            (assignment_map, initialized_variable_names
-            ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
-            if use_tpu:
-
-                def tpu_scaffold():
-                    tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
-                    return tf.train.Scaffold()
-
-                scaffold_fn = tpu_scaffold
-            else:
-                tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
-
-        tf.compat.v1.logging.info("**** Trainable Variables ****")
-        for var in tvars:
-            init_string = ""
-            if var.name in initialized_variable_names:
-                init_string = ", *INIT_FROM_CKPT*"
-            tf.compat.v1.logging.info("  name = %s, shape = %s%s", var.name, var.shape,
-                            init_string)
-
-        output_spec = None
-        if mode == tf.estimator.ModeKeys.TRAIN:
-            train_op = optimization.create_optimizer(total_loss, learning_rate,
-                                                 num_train_steps,
-                                                 num_warmup_steps, use_tpu)
-
-            output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-                mode=mode,
-                loss=total_loss,
-                train_op=train_op,
-                scaffold_fn=scaffold_fn)
-
-        elif mode == tf.estimator.ModeKeys.EVAL:
-            tf.add_to_collection('eval_sp', masked_lm_log_probs)
-            tf.add_to_collection('eval_sp', input_ids)
-            tf.add_to_collection('eval_sp', masked_lm_ids)
-            tf.add_to_collection('eval_sp', info)
-            #tf.summary.scalar('loss', total_loss)
-            #tf.summary.scalar('masked_lm_loss', masked_lm_loss)
-            #tf.summary.scalar('masked_lm_example_loss', masked_lm_example_loss)
-            #tf.summary.scalar('learning_rate', learning_rate)
-
-            def metric_fn(masked_lm_example_loss, masked_lm_log_probs,
-                          masked_lm_ids, masked_lm_weights):
-                """Computes the loss and accuracy of the model."""
-                masked_lm_log_probs = tf.reshape(masked_lm_log_probs,
-                                                 [-1, masked_lm_log_probs.shape[-1]])
-                masked_lm_predictions = tf.argmax(
-                    masked_lm_log_probs, axis=-1, output_type=tf.int32)
-                masked_lm_example_loss = tf.reshape(masked_lm_example_loss,
-                                                    [-1])
-                masked_lm_ids = tf.reshape(masked_lm_ids, [-1])
-                masked_lm_weights = tf.reshape(masked_lm_weights, [-1])
-                masked_lm_accuracy = tf.metrics.accuracy(
-                    labels=masked_lm_ids,
-                    predictions=masked_lm_predictions,
-                    weights=masked_lm_weights)
-                masked_lm_mean_loss = tf.metrics.mean(
-                    values=masked_lm_example_loss, weights=masked_lm_weights)
-
-                return {
-                    "masked_lm_accuracy": masked_lm_accuracy,
-                    "masked_lm_loss": masked_lm_mean_loss,
-                }
-
-            eval_metrics = (metric_fn,
-                            [masked_lm_example_loss, masked_lm_log_probs,
-                             masked_lm_ids, masked_lm_weights])
-            output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-                mode=mode,
-                loss=total_loss,
-                eval_metrics=eval_metrics,
-                scaffold_fn=scaffold_fn)
-        else:
-            #ৈতPredicted shape [None] doesn't match actual shape [1, 128, 768]
-            # error occurs only when using predict. export model doesn't have this error
-            # to fix this, we only output the masked_lm_log_probs instead of full sequence
-
-            # here we should consider if we want to output full sequence or the target item
-            # the easiest way is to output the sequence_output directly
-            # if the sequence output is too large, maybe we need to pick some of them
-            # or just output the target item (highest probability)
-            output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-                mode=mode,
-                #                 predictions=model.get_sequence_output(),
-                predictions=masked_lm_log_probs,
-                scaffold_fn=scaffold_fn)
-        return output_spec
-
-    return model_fn
-
-
 def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
                          label_ids, label_weights):
     """Get loss and log probs for the masked LM."""
     input_tensor = gather_indexes(input_tensor, positions)
 
-    with tf.variable_scope("cls/predictions"):
-        # We apply one more non-linear transformation before the output layer.
-        # This matrix is not used after pre-training.
-        with tf.variable_scope("transform"):
-            input_tensor = tf.layers.dense(
-                input_tensor,
-                units=bert_config.hidden_size,
-                activation=modeling.get_activation(bert_config.hidden_act),
-                kernel_initializer=modeling.create_initializer(
-                    bert_config.initializer_range))
-            input_tensor = modeling.layer_norm(input_tensor)
+    # Using Keras layers for new components is preferred, but for now, minimal change:
+    # tf.compat.v1.variable_scope can often be managed by Keras layers or python scopes.
+    # For this specific structure, direct TF2 equivalents or Keras layers would be a deeper refactor.
+    # Assuming this function will be called within a Keras model or custom training step context eventually.
 
-        # The output weights are the same as the input embeddings, but there is
-        # an output-only bias for each token.
-        output_bias = tf.get_variable(
-            "output_bias",
-            shape=[output_weights.shape[0]],
-            initializer=tf.zeros_initializer())
-        logits = tf.matmul(input_tensor, output_weights, transpose_b=True)
-        logits = tf.nn.bias_add(logits, output_bias)
-        log_probs = tf.nn.log_softmax(logits, axis=-1)
+    # Create a dense layer for transformation
+    transform_dense_layer = tf.keras.layers.Dense(
+        units=bert_config.hidden_size,
+        activation=modeling.get_activation(bert_config.hidden_act),
+        kernel_initializer=modeling.create_initializer(bert_config.initializer_range),
+        name="cls/predictions/transform/dense")
+    # Create LayerNorm for transformation
+    transform_layer_norm = tf.keras.layers.LayerNormalization(name="cls/predictions/transform/LayerNorm")
 
-        label_ids = tf.reshape(label_ids, [-1])
-        label_weights = tf.reshape(label_weights, [-1])
+    transformed_tensor = transform_dense_layer(input_tensor)
+    transformed_tensor = transform_layer_norm(transformed_tensor)
 
-        one_hot_labels = tf.one_hot(
-            label_ids, depth=output_weights.shape[0], dtype=tf.float32)
+    # Output bias
+    # In TF2/Keras, biases are typically part of the Dense layer if use_bias=True.
+    # If a separate bias variable is truly needed outside a layer:
+    output_bias = tf.Variable(tf.zeros_initializer()(shape=[output_weights.shape[0]]), name="cls/predictions/output_bias")
+    
+    logits = tf.matmul(transformed_tensor, output_weights, transpose_b=True)
+    logits = tf.nn.bias_add(logits, output_bias)
+    log_probs = tf.nn.log_softmax(logits, axis=-1)
 
-        # The `positions` tensor might be zero-padded (if the sequence is too
-        # short to have the maximum number of predictions). The `label_weights`
-        # tensor has a value of 1.0 for every real prediction and 0.0 for the
-        # padding predictions.
-        per_example_loss = -tf.reduce_sum(log_probs * one_hot_labels, axis=[-1])
-        numerator = tf.reduce_sum(label_weights * per_example_loss)
-        denominator = tf.reduce_sum(label_weights) + 1e-5
-        loss = numerator / denominator
+    label_ids = tf.reshape(label_ids, [-1])
+    label_weights = tf.reshape(label_weights, [-1])
+
+    one_hot_labels = tf.one_hot(
+        label_ids, depth=output_weights.shape[0], dtype=tf.float32)
+
+    per_example_loss = -tf.reduce_sum(input_tensor=log_probs * one_hot_labels, axis=[-1])
+    numerator = tf.reduce_sum(input_tensor=label_weights * per_example_loss)
+    denominator = tf.reduce_sum(input_tensor=label_weights) + 1e-5
+    loss = numerator / denominator
 
     return (loss, per_example_loss, log_probs)
 
 
 def gather_indexes(sequence_tensor, positions):
-    """Gathers the vectors at the specific positions, so query is correct."""
-    sequence_shape = modeling.get_shape_list(sequence_tensor, expected_rank=3)
+    # This function uses tf.range, tf.reshape, tf.gather which are largely TF2 compatible.
+    # Minor adjustment for get_shape_list if it relies on V1 features not in modeling_v2.py
+    sequence_shape = modeling.get_shape_list(sequence_tensor, expected_rank=3) # Assuming modeling.get_shape_list is TF2 compatible
     batch_size = sequence_shape[0]
     seq_length = sequence_shape[1]
     width = sequence_shape[2]
@@ -423,237 +186,356 @@ def gather_indexes(sequence_tensor, positions):
     return output_tensor
 
 
-def input_fn_builder(input_files,
-                     max_seq_length,
-                     max_predictions_per_seq,
-                     is_training,
-                     num_cpu_threads=4,
-                     is_per_host=False):
-    """Creates an `input_fn` closure to be passed to TPUEstimator."""
-
-    def input_fn(params):
-        """The actual input function."""
-        batch_size = params["batch_size"]
-
-        name_to_features = {
-            "info":
-            tf.FixedLenFeature([1], tf.int64),
-            "input_ids":
-            tf.FixedLenFeature([max_seq_length], tf.int64),
-            "input_mask":
-            tf.FixedLenFeature([max_seq_length], tf.int64),
-            "masked_lm_positions":
-            tf.FixedLenFeature([max_predictions_per_seq], tf.int64),
-            "masked_lm_ids":
-            tf.FixedLenFeature([max_predictions_per_seq], tf.int64),
-            "masked_lm_weights":
-            tf.FixedLenFeature([max_predictions_per_seq], tf.float32),
-        }
-
-        if is_training:
-            d = tf.data.Dataset.from_tensor_slices(tf.constant(input_files))
-            d = d.repeat()
-            d = d.shuffle(buffer_size=len(input_files))
-
-            cycle_length = min(num_cpu_threads, len(input_files))
-
-            d = d.apply(
-                tf.contrib.data.parallel_interleave(
-                    tf.data.TFRecordDataset,
-                    sloppy=is_training,
-                    cycle_length=cycle_length))
-            d = d.shuffle(buffer_size=100)
-        else:
-            d = tf.data.TFRecordDataset(input_files)
-            d = d.repeat()
-
-        d = d.apply(
-            tf.contrib.data.map_and_batch(
-                lambda record: _decode_record(record, name_to_features),
-                batch_size=batch_size,
-                num_parallel_batches=num_cpu_threads,
-                drop_remainder=True if is_training else False))
-        return d
-
-    return input_fn
-
-
 def _decode_record(record, name_to_features):
-    """Decodes a record to a TensorFlow example."""
-    example = tf.parse_single_example(record, name_to_features)
-
-    # tf.Example only supports tf.int64, but the TPU only supports tf.int32.
-    # So cast all int64 to int32.
+    example = tf.io.parse_single_example(serialized=record, features=name_to_features)
     for name in list(example.keys()):
         t = example[name]
         if t.dtype == tf.int64:
-            t = tf.to_int32(t)
+            t = tf.cast(t, tf.int32)
         example[name] = t
-
     return example
+
+
+def create_dataset(input_files, max_seq_length, max_predictions_per_seq, batch_size, 
+                     is_training, num_cpu_threads=tf.data.AUTOTUNE):
+    name_to_features = {
+        "info": tf.io.FixedLenFeature([1], tf.int64),
+        "input_ids": tf.io.FixedLenFeature([max_seq_length], tf.int64),
+        "input_mask": tf.io.FixedLenFeature([max_seq_length], tf.int64),
+        "masked_lm_positions": tf.io.FixedLenFeature([max_predictions_per_seq], tf.int64),
+        "masked_lm_ids": tf.io.FixedLenFeature([max_predictions_per_seq], tf.int64),
+        "masked_lm_weights": tf.io.FixedLenFeature([max_predictions_per_seq], tf.float32),
+    }
+
+    if not input_files:
+        return None
+
+    d = tf.data.Dataset.from_tensor_slices(input_files)
+    if is_training:
+        d = d.repeat()
+        d = d.shuffle(buffer_size=len(input_files))
+    
+    # TFRecordDataset opens files, so interleave files before map and batch
+    d = d.interleave(lambda x: tf.data.TFRecordDataset(x), 
+                     cycle_length=num_cpu_threads,
+                     num_parallel_calls=tf.data.AUTOTUNE,
+                     deterministic=not is_training)
+
+    d = d.map(lambda record: _decode_record(record, name_to_features),
+              num_parallel_calls=num_cpu_threads)
+    
+    if is_training:
+        d = d.shuffle(buffer_size=100)
+    
+    d = d.batch(batch_size, drop_remainder=is_training)
+    d = d.prefetch(buffer_size=tf.data.AUTOTUNE)
+    return d
+
+
+class WarmUpAndPolynomialDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
+    """Applies linear warmup and then polynomial decay."""
+    def __init__(self, initial_learning_rate, target_learning_rate, warmup_steps, decay_steps, power, name=None):
+        super(WarmUpAndPolynomialDecay, self).__init__()
+        self.initial_learning_rate = initial_learning_rate # Typically 0 for warmup start
+        self.target_learning_rate = target_learning_rate # This is FLAGS.learning_rate
+        self.warmup_steps = warmup_steps
+        self.decay_steps = decay_steps # Total steps for polynomial decay AFTER warmup
+        self.power = power
+        self.custom_name = name
+
+        # Create the polynomial decay part
+        self.polynomial_decay_schedule = tf.keras.optimizers.schedules.PolynomialDecay(
+            initial_learning_rate=self.target_learning_rate, # Starts after warmup reaches target
+            decay_steps=self.decay_steps,
+            end_learning_rate=0.0, # Or a configured minimum
+            power=self.power,
+            cycle=False # Assuming cycle=False from previous setup
+        )
+
+    def __call__(self, step):
+        step = tf.cast(step, tf.float32)
+        warmup_steps_float = tf.cast(self.warmup_steps, tf.float32)
+        
+        # Linear warmup phase
+        def warmup_lr():
+            return self.initial_learning_rate + \
+                   (self.target_learning_rate - self.initial_learning_rate) * (step / warmup_steps_float)
+
+        # Polynomial decay phase (adjust step for the decay schedule)
+        def polynomial_decay_lr():
+            # Step for polynomial decay starts from 0 after warmup is complete
+            decay_step = step - warmup_steps_float 
+            return self.polynomial_decay_schedule(decay_step)
+
+        learning_rate = tf.cond(
+            step < warmup_steps_float,
+            warmup_lr,
+            polynomial_decay_lr
+        )
+        return learning_rate
+
+    def get_config(self):
+        return {
+            "initial_learning_rate": self.initial_learning_rate,
+            "target_learning_rate": self.target_learning_rate,
+            "warmup_steps": self.warmup_steps,
+            "decay_steps": self.decay_steps,
+            "power": self.power,
+            "name": self.custom_name
+        }
 
 
 def main(_):
     tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.INFO)
 
     if not FLAGS.do_train and not FLAGS.do_eval:
-        raise ValueError(
-            "At least one of `do_train` or `do_eval` must be True.")
+        raise ValueError("At least one of `do_train` or `do_eval` must be True.")
 
     bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
 
     if FLAGS.max_seq_length > bert_config.max_position_embeddings:
         raise ValueError(
-            "Cannot use sequence length %d because the BERT model "
-            "was only trained up to sequence length %d" %
-            (FLAGS.max_seq_length, bert_config.max_position_embeddings))
+            f"Cannot use sequence length {FLAGS.max_seq_length} because the BERT model "
+            f"was only trained up to sequence length {bert_config.max_position_embeddings}")
 
-    tf.compat.v1.gfile.MakeDirs(FLAGS.checkpointDir)
+    if not tf.io.gfile.exists(FLAGS.checkpointDir):
+        tf.io.gfile.makedirs(FLAGS.checkpointDir)
 
-    num_train_steps = None
-    num_warmup_steps = None
-    if FLAGS.do_train:
-        num_train_steps = FLAGS.num_train_steps
-        num_warmup_steps = FLAGS.num_warmup_steps
-
-    tpu_cluster_resolver = None
-    if FLAGS.use_tpu and FLAGS.tpu_name:
-        tpu_cluster_resolver = tf.compat.v1.distribute.cluster_resolver.TPUClusterResolver(
-            FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
-
-    _is_per_host_for_input_fn = False 
-    if FLAGS.use_tpu:
-        # This line will only be executed if use_tpu is True.
-        # If tf.compat.v1.estimator is missing, it might error here if use_tpu is True.
-        _is_per_host_for_input_fn = estimator_v1.tpu.InputPipelineConfig.PER_HOST_V2
-
-    model_fn = model_fn_builder(
-        bert_config=bert_config,
-        init_checkpoint=FLAGS.init_checkpoint,
-        learning_rate=FLAGS.learning_rate,
-        num_train_steps=num_train_steps,
-        num_warmup_steps=num_warmup_steps,
-        use_tpu=FLAGS.use_tpu,
-        use_one_hot_embeddings=FLAGS.use_tpu,
-        item_size=bert_config.vocab_size)
-
-    train_input_fn = None
+    # Create datasets
+    train_dataset = None
     if FLAGS.do_train:
         train_input_files = []
-        if FLAGS.train_input_file: # Check if None or empty
+        if FLAGS.train_input_file:
             for input_pattern in FLAGS.train_input_file.split(","):
-                train_input_files.extend(tf.compat.v1.gfile.Glob(input_pattern))
+                train_input_files.extend(tf.io.gfile.glob(input_pattern))
         if not train_input_files:
-             tf.compat.v1.logging.warning("No training input files found for pattern: {}".format(FLAGS.train_input_file))
-        # else: # Only create input_fn if files are found, or handle empty case in input_fn_builder
-        tf.compat.v1.logging.info("*** Train Input Files ***")
-        for input_file in train_input_files:
-            tf.compat.v1.logging.info("  %s" % input_file)
-        train_input_fn = input_fn_builder(
-            input_files=train_input_files,
-            max_seq_length=FLAGS.max_seq_length,
-            max_predictions_per_seq=FLAGS.max_predictions_per_seq,
-            is_training=True,
-            is_per_host=_is_per_host_for_input_fn)
-
-    eval_input_fn = None
+            tf.compat.v1.logging.warning(f"No training input files found for pattern: {FLAGS.train_input_file}")
+        else:
+            tf.compat.v1.logging.info(f"*** Train Input Files ***")
+            for f in train_input_files: tf.compat.v1.logging.info(f"  {f}")
+            train_dataset = create_dataset(train_input_files, FLAGS.max_seq_length, 
+                                           FLAGS.max_predictions_per_seq, FLAGS.batch_size, is_training=True)
+    
+    eval_dataset = None
     if FLAGS.do_eval:
         eval_input_files = []
-        if FLAGS.test_input_file: # Check if None or empty
+        if FLAGS.test_input_file:
             for input_pattern in FLAGS.test_input_file.split(","):
-                eval_input_files.extend(tf.compat.v1.gfile.Glob(input_pattern))
+                eval_input_files.extend(tf.io.gfile.glob(input_pattern))
         if not eval_input_files:
-            tf.compat.v1.logging.warning("No evaluation input files found for pattern: {}".format(FLAGS.test_input_file))
-        # else:
-        tf.compat.v1.logging.info("*** Test Input Files ***")
-        for input_file in eval_input_files:
-            tf.compat.v1.logging.info("  %s" % input_file)
-        eval_input_fn = input_fn_builder(
-            input_files=eval_input_files,
-            max_seq_length=FLAGS.max_seq_length,
-            max_predictions_per_seq=FLAGS.max_predictions_per_seq,
-            is_training=False,
-            is_per_host=_is_per_host_for_input_fn)
+            tf.compat.v1.logging.warning(f"No evaluation input files found for pattern: {FLAGS.test_input_file}")
+        else:
+            tf.compat.v1.logging.info(f"*** Eval Input Files ***")
+            for f in eval_input_files: tf.compat.v1.logging.info(f"  {f}")
+            eval_dataset = create_dataset(eval_input_files, FLAGS.max_seq_length, 
+                                          FLAGS.max_predictions_per_seq, FLAGS.batch_size, is_training=False)
 
-    if FLAGS.use_tpu:
-        tpu_config = estimator_v1.tpu.TPUConfig(
-            iterations_per_loop=FLAGS.iterations_per_loop,
-            num_shards=FLAGS.num_tpu_cores,
-            per_host_input_for_training=_is_per_host_for_input_fn
+    # Create Model
+    model = modeling.BertModel(
+        config=bert_config
+        # is_training is handled by the `training` arg in call()
+        # use_one_hot_embeddings is no longer a param for Keras BertModel
+    )
+
+    # Optimizer
+    num_train_steps = FLAGS.num_train_steps if FLAGS.do_train else 0
+    num_warmup_steps = FLAGS.num_warmup_steps if FLAGS.do_train else 0
+    
+    if num_warmup_steps > 0:
+        # Total decay steps for PolynomialDecay is after warmup
+        polynomial_decay_total_steps = num_train_steps - num_warmup_steps 
+        if polynomial_decay_total_steps <= 0:
+             # Handle edge case: if all steps are warmup, or more warmup than total steps
+             polynomial_decay_total_steps = 1 # Avoid non-positive decay_steps
+             tf.compat.v1.logging.warning(
+                 f"num_train_steps ({num_train_steps}) is less than or equal to num_warmup_steps ({num_warmup_steps}). \
+                 Polynomial decay may not behave as expected."
+             )
+
+        learning_rate_schedule = WarmUpAndPolynomialDecay(
+            initial_learning_rate=0.0, # Start warmup from 0
+            target_learning_rate=FLAGS.learning_rate,
+            warmup_steps=num_warmup_steps,
+            decay_steps=polynomial_decay_total_steps, 
+            power=1.0, # Standard power for linear decay after warmup in many BERT setups
+            name="WarmUpAndPolynomialDecay")
+    else:
+        # No warmup, just polynomial decay
+        learning_rate_schedule = tf.keras.optimizers.schedules.PolynomialDecay(
+            initial_learning_rate=FLAGS.learning_rate,
+            decay_steps=num_train_steps, 
+            end_learning_rate=0.0,
+            power=1.0,
+            cycle=False
         )
-        run_config = estimator_v1.tpu.RunConfig(
-            cluster=tpu_cluster_resolver,
-            master=FLAGS.master,
-            model_dir=FLAGS.checkpointDir, # Changed from FLAGS.output_dir
-            save_checkpoints_steps=FLAGS.save_checkpoints_steps,
-            # keep_checkpoint_max=FLAGS.keep_checkpoint_max, # Add if keep_checkpoint_max flag exists
-            tpu_config=tpu_config
-        )
-        estimator = estimator_v1.tpu.TPUEstimator(
-            use_tpu=True,
-            model_fn=model_fn,
-            config=run_config,
-            train_batch_size=FLAGS.batch_size, # Using FLAGS.batch_size
-            eval_batch_size=FLAGS.batch_size   # Using FLAGS.batch_size
-        )
-    else:  # Not using TPU (CPU/GPU path)
-        run_config = estimator_v1.RunConfig(
-            master=FLAGS.master,
-            model_dir=FLAGS.checkpointDir, # Changed from FLAGS.output_dir
-            save_checkpoints_steps=FLAGS.save_checkpoints_steps
-            # keep_checkpoint_max=FLAGS.keep_checkpoint_max, # Add if keep_checkpoint_max flag exists
-        )
-        estimator_params = {"batch_size": FLAGS.batch_size} # Using FLAGS.batch_size
-        estimator = estimator_v1.Estimator(
-            model_fn=model_fn,
-            config=run_config,
-            params=estimator_params
-        )
+
+    optimizer = tf.keras.optimizers.AdamW(
+        learning_rate=learning_rate_schedule, 
+        weight_decay=0.01, 
+        beta_1=0.9,
+        beta_2=0.999,
+        epsilon=1e-6
+    )
+
+    # Checkpoint Manager
+    ckpt = tf.train.Checkpoint(optimizer=optimizer, model=model)
+    # To ensure that the model variables are created for checkpointing, build the model
+    # by calling it once with dummy data that matches the expected input spec.
+    # This is important if restoring a checkpoint before the first training step.
+    if FLAGS.max_seq_length > 0: # Only build if max_seq_length is valid
+        dummy_input_ids = tf.zeros([1, FLAGS.max_seq_length], dtype=tf.int32)
+        dummy_attention_mask = tf.zeros([1, FLAGS.max_seq_length], dtype=tf.int32)
+        dummy_token_type_ids = tf.zeros([1, FLAGS.max_seq_length], dtype=tf.int32)
+        try:
+            model(dummy_input_ids, attention_mask=dummy_attention_mask, token_type_ids=dummy_token_type_ids, training=False)
+            tf.compat.v1.logging.info("Model built with dummy input.")
+        except Exception as e:
+            tf.compat.v1.logging.error(f"Error building model with dummy input: {e}")
+            # Potentially raise e or handle as critical error
+
+    ckpt_manager = tf.train.CheckpointManager(ckpt, FLAGS.checkpointDir, max_to_keep=FLAGS.save_checkpoints_steps or 5) # Default to 5 if 0
+
+    if ckpt_manager.latest_checkpoint:
+        tf.compat.v1.logging.info(f"Restored from {ckpt_manager.latest_checkpoint}")
+        ckpt.restore(ckpt_manager.latest_checkpoint).expect_partial() # Allow partial restore if optimizer state changed etc.
+    else:
+        tf.compat.v1.logging.info("Initializing from scratch.")
+
+    # Metrics
+    train_loss_metric = tf.keras.metrics.Mean("train_loss")
+    # For MLM, accuracy might be: masked_lm_accuracy = tf.keras.metrics.Accuracy("masked_lm_accuracy")
+
+    @tf.function
+    def train_step(batch_data):
+        input_ids = batch_data["input_ids"]
+        input_mask = batch_data["input_mask"]
+        token_type_ids = batch_data.get("token_type_ids") 
+        if token_type_ids is None: 
+            pass 
+            
+        masked_lm_positions = batch_data["masked_lm_positions"]
+        masked_lm_ids = batch_data["masked_lm_ids"]
+        masked_lm_weights = batch_data["masked_lm_weights"]
+
+        with tf.GradientTape() as tape:
+            sequence_output, _ = model(input_ids,
+                                       attention_mask=input_mask,
+                                       token_type_ids=token_type_ids, 
+                                       training=True)
+            
+            embedding_table = model.get_embedding_table() 
+            loss, _, _ = get_masked_lm_output(
+                bert_config, sequence_output, embedding_table,
+                masked_lm_positions, masked_lm_ids, masked_lm_weights)
+        
+        gradients = tape.gradient(loss, model.trainable_variables)
+        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+        
+        train_loss_metric.update_state(loss)
+        return loss
+
+    # Metrics for evaluation
+    eval_loss_metric = tf.keras.metrics.Mean("eval_loss")
+    # Add other eval metrics if needed, e.g.:
+    # eval_masked_lm_accuracy = tf.keras.metrics.Accuracy("eval_masked_lm_accuracy")
+
+    @tf.function
+    def eval_step(batch_data):
+        input_ids = batch_data["input_ids"]
+        input_mask = batch_data["input_mask"]
+        token_type_ids = batch_data.get("token_type_ids")
+        if token_type_ids is None:
+            pass # BertEmbeddings will handle it
+
+        masked_lm_positions = batch_data["masked_lm_positions"]
+        masked_lm_ids = batch_data["masked_lm_ids"]
+        masked_lm_weights = batch_data["masked_lm_weights"]
+
+        # Forward pass
+        sequence_output, _ = model(input_ids,
+                                   attention_mask=input_mask,
+                                   token_type_ids=token_type_ids,
+                                   training=False) # training=False for evaluation
+        
+        embedding_table = model.get_embedding_table()
+        loss, per_example_loss, log_probs = get_masked_lm_output(
+            bert_config, sequence_output, embedding_table,
+            masked_lm_positions, masked_lm_ids, masked_lm_weights)
+        
+        eval_loss_metric.update_state(loss)
+        
+        # Example for accuracy (if masked_lm_predictions are needed)
+        # masked_lm_predictions = tf.argmax(input=log_probs, axis=-1, output_type=tf.int32)
+        # eval_masked_lm_accuracy.update_state(masked_lm_ids, masked_lm_predictions, sample_weight=masked_lm_weights)
+        
+        return loss # , per_example_loss, log_probs (if needed for other metrics)
 
     if FLAGS.do_train:
-        if not train_input_fn:
-            tf.compat.v1.logging.error("Training enabled but no valid training input files were found/processed.")
-            return # Or raise error
-
+        if not train_dataset:
+            tf.compat.v1.logging.error("Training enabled but no training dataset was created.")
+            return
         tf.compat.v1.logging.info("***** Running training *****")
-        tf.compat.v1.logging.info("  Batch size = %d", FLAGS.batch_size) # Using FLAGS.batch_size
-        tf.compat.v1.logging.info("  Num steps = %d", num_train_steps)
-        estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
+        tf.compat.v1.logging.info(f"  Batch size = {FLAGS.batch_size}")
+        tf.compat.v1.logging.info(f"  Num steps = {num_train_steps}")
+        
+        current_step = optimizer.iterations.numpy()
+        train_loss_metric.reset_state() # Reset before new training run or continuation
+        for step_idx in range(current_step, num_train_steps):
+            # A common way to iterate: make dataset an iterator
+            # train_iter = iter(train_dataset) 
+            # batch = next(train_iter)
+            # Or if dataset is already repeating and we just take N steps:
+            try:
+                batch = next(iter(train_dataset)) 
+            except StopIteration:
+                # This shouldn't happen if train_dataset.repeat() is used and num_train_steps is finite.
+                # If it does, re-initialize iterator (though this implies epochs, not just global steps)
+                train_iter = iter(train_dataset) # Re-init iterator if dataset is not infinite
+                batch = next(train_iter)
+            
+            loss_val = train_step(batch)
+            
+            if step_idx % 100 == 0: 
+                tf.compat.v1.logging.info(f"Step {optimizer.iterations.numpy()}/{num_train_steps}, Loss: {train_loss_metric.result()}")
+            
+            if step_idx > 0 and step_idx % FLAGS.save_checkpoints_steps == 0:
+                saved_path = ckpt_manager.save()
+                tf.compat.v1.logging.info(f"Saved checkpoint for step {optimizer.iterations.numpy()}: {saved_path}")
+        
+        final_train_loss = train_loss_metric.result()
+        tf.compat.v1.logging.info(f"Training finished. Final Loss: {final_train_loss}")
+        # train_loss_metric.reset_states() # Done at the start of training
 
     if FLAGS.do_eval:
-        if not eval_input_fn:
-            tf.compat.v1.logging.error("Evaluation enabled but no valid evaluation input files were found/processed.")
-            return # Or raise error
-
+        if not eval_dataset:
+            tf.compat.v1.logging.error("Evaluation enabled but no eval dataset was created.")
+            return
         tf.compat.v1.logging.info("***** Running evaluation *****")
-        tf.compat.v1.logging.info("  Batch size = %d", FLAGS.batch_size) # Using FLAGS.batch_size
+        tf.compat.v1.logging.info(f"  Batch size = {FLAGS.batch_size}")
+        # max_eval_steps is not directly used in dataset iteration but can limit the eval
+        # For a full evaluation, iterate over the entire eval_dataset once.
         
-        # The original code for EvalHooks and extracting results:
-        hooks = [EvalHooks()]
-        eval_output = estimator.evaluate(
-           input_fn=eval_input_fn,
-           steps=FLAGS.max_eval_steps,
-           hooks=hooks) # Pass hooks here
+        eval_loss_metric.reset_state()
+        # eval_masked_lm_accuracy.reset_states() # if using accuracy
 
-        # Log eval results if needed from eval_output
+        eval_steps_count = 0
+        for batch_idx, batch in enumerate(eval_dataset):
+            if FLAGS.max_eval_steps and batch_idx >= FLAGS.max_eval_steps:
+                break
+            eval_step(batch)
+            eval_steps_count += 1
+            if batch_idx % 100 == 0:
+                 tf.compat.v1.logging.info(f"Eval Step {batch_idx}, Current Eval Loss: {eval_loss_metric.result()}")
+
         tf.compat.v1.logging.info("***** Eval results *****")
-        if eval_output: # eval_output might be None if estimator doesn't return metrics dict directly
-            for key in sorted(eval_output.keys()):
-                tf.compat.v1.logging.info("  %s = %s", key, str(eval_output[key]))
-        else:
-            tf.compat.v1.logging.info("EvalHook will print its own summary.")
-            
-        # If predict is needed, it would follow a similar pattern:
-    # if FLAGS.do_predict:
-    #    # ... setup predict_input_fn ...
-    #    predictions = estimator.predict(input_fn=predict_input_fn)
-    #    # ... process predictions ...
+        tf.compat.v1.logging.info(f"Evaluation on {eval_steps_count} batches complete.")
+        tf.compat.v1.logging.info(f"  Eval Loss = {eval_loss_metric.result()}")
+        # if eval_masked_lm_accuracy:
+        #    tf.compat.v1.logging.info(f"  Eval Masked LM Accuracy = {eval_masked_lm_accuracy.result()}")
+        eval_loss_metric.reset_state()
+        # eval_masked_lm_accuracy.reset_states()
 
-    # The serving_input_receiver_fn and other parts of main like tf.app.run() remain unchanged below this block.
-    # Ensure this edit replaces the main() function's body from its beginning 
-    # down to (but not including) the serving_input_receiver_fn or the final tf.app.run() call.
-    # This is a replacement of most of the main() function.
-    # ... (existing code like serving_input_receiver_fn and if __name__ == '__main__')
+    tf.compat.v1.logging.info("Script execution finished.") # Updated log message
 
 
 if __name__ == "__main__":
