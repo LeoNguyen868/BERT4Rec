@@ -228,6 +228,7 @@ def create_training_instances(all_documents_raw,
                               force_last=False):
     """Create `TrainingInstance`s from raw text."""
     all_documents = {}
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting instance creation process... force_last={force_last}, dupe_factor={dupe_factor}")
 
     if force_last:
         max_num_tokens = max_seq_length
@@ -269,6 +270,9 @@ def create_training_instances(all_documents_raw,
 
     # multithread
     start_time = time.time()
+    # Temporarily reduce pool_size for debugging, can be passed from main call later
+    # pool_size = 1 # DEBUG: Reduced pool size
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Initializing multiprocessing pool with size: {pool_size}")
     pool = multiprocessing.Pool(processes=pool_size)
     #rng.shuffle(all_documents.keys()) #this is shuffle user
     user_list = list(all_documents.keys())
@@ -283,7 +287,10 @@ def create_training_instances(all_documents_raw,
     for step in range(dupe_factor):
         #print("step:", step)
         random.shuffle(user_list)
-        for user in user_list:
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting dupe_factor step {step+1}/{dupe_factor} for {len(user_list)} users.")
+        for idx, user in enumerate(user_list):
+            if idx % 100 == 0: # Log every 100 users submitted to pool
+                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Submitting user {idx+1}/{len(user_list)} (User ID: {user}) to pool in step {step+1}.")
             #print("user", user)
             pool.apply_async(
                 create_instances_threading,
@@ -294,6 +301,7 @@ def create_training_instances(all_documents_raw,
 
     pool.close()
     pool.join()
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Multiprocessing pool finished.")
 
     # for result in results:
     #     instances.extend(result)
@@ -309,6 +317,7 @@ def create_instances_threading(all_documents, user, max_seq_length, short_seq_pr
                                mask_prob, step):
     document_instances = []
     # Account for [CLS], [SEP], [SEP]
+    # print(f"Thread for user {user}, step {step} START") # Can be too verbose
     max_num_tokens = max_seq_length - 1
 
     # We *sometimes* want to use shorter sequences to minimize the mismatch
@@ -321,6 +330,7 @@ def create_instances_threading(all_documents, user, max_seq_length, short_seq_pr
                 all_documents, user, doc_index, max_num_tokens,
                 short_seq_prob, masked_lm_prob, max_predictions_per_seq,
                 vocab, rng, mask_prob))
+    # print(f"Thread for user {user}, step {step} END, instances: {len(document_instances)}")
     return document_instances
 
 
@@ -668,7 +678,10 @@ def main():
     # Always load data from data_file
     print("load data from", data_file)
     f = open(data_file, 'r')
-    for line in f:
+    start_load_time = time.time()
+    for line_idx, line in enumerate(f):
+        if (line_idx + 1) % 200000 == 0: # Log every 200,000 lines
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Processing line {line_idx+1} from {data_file}")
         parts = line.rstrip().split(' ') 
         if len(parts) == 2: 
             user, item = parts[0], parts[1]
@@ -684,6 +697,7 @@ def main():
             tf.compat.v1.logging.warning(f"Skipping malformed line: {line.rstrip()}")
             continue
     f.close()
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Finished loading {data_file} in {time.time() - start_load_time:.2f} seconds. {len(data)} users loaded.")
 
     if os.path.isfile(user_history_file) and os.path.isfile(vocab_file):
         print("load user history from", user_history_file)
