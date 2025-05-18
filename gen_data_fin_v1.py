@@ -228,7 +228,8 @@ def create_training_instances(all_documents_raw,
                               force_last=False):
     """Create `TrainingInstance`s from raw text."""
     all_documents = {}
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting instance creation process... force_last={force_last}, dupe_factor={dupe_factor}")
+    current_dupe_factor = dupe_factor 
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting instance creation process... force_last={force_last}, dupe_factor for this call={current_dupe_factor}")
 
     if force_last:
         max_num_tokens = max_seq_length
@@ -283,11 +284,9 @@ def create_training_instances(all_documents_raw,
     def log_result(result):
         results.extend(result)
 
-    #for step in range(dupe_factor):
-    for step in range(dupe_factor):
-        #print("step:", step)
+    for step in range(current_dupe_factor):
         random.shuffle(user_list)
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting dupe_factor step {step+1}/{dupe_factor} for {len(user_list)} users.")
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting dupe_factor step {step+1}/{current_dupe_factor} for {len(user_list)} users.")
         for idx, user in enumerate(user_list):
             if idx % 100 == 0: # Log every 100 users submitted to pool
                 print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Submitting user {idx+1}/{len(user_list)} (User ID: {user}) to pool in step {step+1}.")
@@ -315,22 +314,19 @@ def create_training_instances(all_documents_raw,
 def create_instances_threading(all_documents, user, max_seq_length, short_seq_prob,
                                masked_lm_prob, max_predictions_per_seq, vocab, rng,
                                mask_prob, step):
+    # Verbose logging for debugging hangs
+    print(f"    [{time.strftime('%Y-%m-%d %H:%M:%S')}] THREADING: User {user}, Step {step+1} - START")
     document_instances = []
-    # Account for [CLS], [SEP], [SEP]
-    # print(f"Thread for user {user}, step {step} START") # Can be too verbose
     max_num_tokens = max_seq_length - 1
 
-    # We *sometimes* want to use shorter sequences to minimize the mismatch
-    # between pre-training and fine-tuning. However, we select the documents
-    # randomly based on the input length to make sure that the distribution
-    # of sentence lengths doesn't change.
     for doc_index in range(len(all_documents[user])):
+        # print(f"      [{time.strftime('%Y-%m-%d %H:%M:%S')}] THREADING: User {user}, Step {step+1}, Doc {doc_index} - Processing document")
         document_instances.extend(
             create_instances_from_document_train(
                 all_documents, user, doc_index, max_num_tokens,
                 short_seq_prob, masked_lm_prob, max_predictions_per_seq,
-                vocab, rng, mask_prob))
-    # print(f"Thread for user {user}, step {step} END, instances: {len(document_instances)}")
+                vocab, rng, mask_prob, step)) # Pass step for logging
+    print(f"    [{time.strftime('%Y-%m-%d %H:%M:%S')}] THREADING: User {user}, Step {step+1} - END, instances created: {len(document_instances)}")
     return document_instances
 
 
@@ -437,49 +433,35 @@ def create_instances_from_document_test(all_documents, user, max_seq_length):
 
 def create_instances_from_document_train(
         all_documents, user, doc_index, max_seq_length, short_seq_prob, masked_lm_prob,
-        max_predictions_per_seq, vocab, rng, mask_prob):
-    """Creates `TrainingInstance`s for a single document."""
+        max_predictions_per_seq, vocab, rng, mask_prob, step_for_log):
+    print(f"      [{time.strftime('%Y-%m-%d %H:%M:%S')}] DOC_TRAIN: User {user}, Step {step_for_log+1}, Doc {doc_index} - START")
     document = all_documents[user][doc_index]
-
-    # Account for [CLS], [SEP], [SEP]
     max_num_tokens = max_seq_length -1
 
-    # We *sometimes* want to use shorter sequences to minimize the mismatch
-    # between pre-training and fine-tuning. However, we select the documents
-    # randomly based on the input length to make sure that the distribution
-    # of sentence lengths doesn't change.
     target_seq_length = max_num_tokens
     if rng.random() < short_seq_prob:
         target_seq_length = rng.randint(2, max_num_tokens)
 
-    # We DON'T just concatenate all of the tokens from a document into a long
-    # sequence and choose an arbitrary split point because this would make the
-    # next sentence prediction task too easy. Instead, we split the input into
-    # segments "A" and "B" based on the actual "sentences" provided by the user
-    # input.
-    instances = []
-
     info = [int(user.split('_')[1])]
-    # tokens_a = document
-    # tokens_b = []
-    tokens = list(document)  # create a new list
-
-    # if len(tokens_a) >= target_seq_length:
-    #     tokens_a = tokens_a[0:target_seq_length]
-    #     tokens_b = []
+    print(f"        [{time.strftime('%Y-%m-%d %H:%M:%S')}] DOC_TRAIN: User {user}, Step {step_for_log+1}, Doc {doc_index} - Preparing tokens. Original document length: {len(document)}")
+    tokens = list(document) 
+    print(f"        [{time.strftime('%Y-%m-%d %H:%M:%S')}] DOC_TRAIN: User {user}, Step {step_for_log+1}, Doc {doc_index} - Tokens list created. Length: {len(tokens)}. Vocab keys to list next.")
+    vocab_keys_list = list(vocab.keys())
+    print(f"        [{time.strftime('%Y-%m-%d %H:%M:%S')}] DOC_TRAIN: User {user}, Step {step_for_log+1}, Doc {doc_index} - Vocab keys list created. Length: {len(vocab_keys_list)}. Calling create_masked_lm_predictions.")
 
     (tokens, masked_lm_positions,
      masked_lm_labels) = create_masked_lm_predictions(
-         tokens, masked_lm_prob, max_predictions_per_seq, list(vocab.keys()), rng,
-         mask_prob)
+         tokens, masked_lm_prob, max_predictions_per_seq, vocab_keys_list, rng,
+         mask_prob, user, step_for_log, doc_index)
+    print(f"        [{time.strftime('%Y-%m-%d %H:%M:%S')}] DOC_TRAIN: User {user}, Step {step_for_log+1}, Doc {doc_index} - Returned from create_masked_lm_predictions.")
+
     instance = TrainingInstance(
         info=info,
         tokens=tokens,
         masked_lm_positions=masked_lm_positions,
         masked_lm_labels=masked_lm_labels)
-    instances.append(instance)
-
-    return instances
+    print(f"      [{time.strftime('%Y-%m-%d %H:%M:%S')}] DOC_TRAIN: User {user}, Step {step_for_log+1}, Doc {doc_index} - END, instances: {len(instances)}")
+    return [instance]
 
 
 def create_masked_lm_predictions_force_last(tokens):
@@ -519,8 +501,11 @@ def create_masked_lm_predictions_force_last(tokens):
 
 def create_masked_lm_predictions(tokens, masked_lm_prob,
                                  max_predictions_per_seq, vocab_words, rng,
-                                 mask_prob):
+                                 mask_prob,
+                                 # For logging purposes
+                                 user_for_log, step_for_log, doc_index_for_log):
     """Creates the predictions for the masked LM objective."""
+    print(f"        [{time.strftime('%Y-%m-%d %H:%M:%S')}] MASK_PRED: User {user_for_log}, Step {step_for_log+1}, Doc {doc_index_for_log} - START. Tokens length: {len(tokens)}")
 
     cand_indexes = []
     # [CLS] and [SEP] will be excluded
@@ -538,12 +523,13 @@ def create_masked_lm_predictions(tokens, masked_lm_prob,
 
     masked_lms = []
     covered_indexes = set()
-    for index in cand_indexes:
+    for index_pos, index in enumerate(cand_indexes):
         if len(masked_lms) >= num_to_predict:
             break
         if index in covered_indexes:
             continue
         covered_indexes.add(index)
+        # print(f"          [{time.strftime('%Y-%m-%d %H:%M:%S')}] MASK_PRED: User {user_for_log}, Step {step_for_log+1}, Doc {doc_index_for_log} - Masking loop {index_pos}, Index {index}")
 
         masked_token = None
         # 80% of the time, replace with [MASK]
@@ -575,7 +561,7 @@ def create_masked_lm_predictions(tokens, masked_lm_prob,
     #     masked_lm_positions.append(index)
     #     masked_lm_labels.append(tokens[index])
     #     print("Cannot find a token to mask")
-
+    print(f"        [{time.strftime('%Y-%m-%d %H:%M:%S')}] MASK_PRED: User {user_for_log}, Step {step_for_log+1}, Doc {doc_index_for_log} - END. Predicted: {len(masked_lms)}")
     return (output_tokens, masked_lm_positions, masked_lm_labels)
 
 
