@@ -20,12 +20,12 @@ from __future__ import print_function
 
 import os
 import modeling
-import optimization
+import optimization_v1 as optimization
 import tensorflow as tf
 import numpy as np
 import sys
 import pickle
-flags = tf.flags
+flags = tf.compat.v1.flags
 
 FLAGS = flags.FLAGS
 
@@ -90,25 +90,25 @@ flags.DEFINE_integer("max_eval_steps", 1000, "Maximum number of eval steps.")
 
 flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
 
-tf.flags.DEFINE_string(
+tf.compat.v1.flags.DEFINE_string(
     "tpu_name", None,
     "The Cloud TPU to use for training. This should be either the name "
     "used when creating the Cloud TPU, or a grpc://ip.address.of.tpu:8470 "
     "url.")
 
-tf.flags.DEFINE_string(
+tf.compat.v1.flags.DEFINE_string(
     "tpu_zone", None,
     "[Optional] GCE zone where the Cloud TPU is located in. If not "
     "specified, we will attempt to automatically detect the GCE project from "
     "metadata.")
 
-tf.flags.DEFINE_string(
+tf.compat.v1.flags.DEFINE_string(
     "gcp_project", None,
     "[Optional] Project name for the Cloud TPU-enabled project. If not "
     "specified, we will attempt to automatically detect the GCE project from "
     "metadata.")
 
-tf.flags.DEFINE_string("master", None, "[Optional] TensorFlow master URL.")
+tf.compat.v1.flags.DEFINE_string("master", None, "[Optional] TensorFlow master URL.")
 
 flags.DEFINE_integer(
     "num_tpu_cores", 8,
@@ -120,9 +120,9 @@ flags.DEFINE_string("user_history_filename", None, "user history filename")
 
 
 
-class EvalHooks(tf.train.SessionRunHook):
+class EvalHooks(tf.compat.v1.train.SessionRunHook):
     def __init__(self):
-        tf.logging.info('run init')
+        tf.compat.v1.logging.info('run init')
 
     def begin(self):
         self.valid_user = 0.0
@@ -237,9 +237,9 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
     def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
         """The `model_fn` for TPUEstimator."""
 
-        tf.logging.info("*** Features ***")
+        tf.compat.v1.logging.info("*** Features ***")
         for name in sorted(features.keys()):
-            tf.logging.info("  name = %s, shape = %s" % (name,
+            tf.compat.v1.logging.info("  name = %s, shape = %s" % (name,
                                                          features[name].shape))
 
         info = features["info"]
@@ -281,12 +281,12 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
             else:
                 tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
 
-        tf.logging.info("**** Trainable Variables ****")
+        tf.compat.v1.logging.info("**** Trainable Variables ****")
         for var in tvars:
             init_string = ""
             if var.name in initialized_variable_names:
                 init_string = ", *INIT_FROM_CKPT*"
-            tf.logging.info("  name = %s, shape = %s%s", var.name, var.shape,
+            tf.compat.v1.logging.info("  name = %s, shape = %s%s", var.name, var.shape,
                             init_string)
 
         output_spec = None
@@ -502,7 +502,7 @@ def _decode_record(record, name_to_features):
 
 
 def main(_):
-    tf.logging.set_verbosity(tf.logging.INFO)
+    tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.INFO)
 
     if not FLAGS.do_train and not FLAGS.do_eval:
         raise ValueError(
@@ -510,33 +510,33 @@ def main(_):
 
     bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
 
-    tf.gfile.MakeDirs(FLAGS.checkpointDir)
+    tf.compat.v1.gfile.MakeDirs(FLAGS.checkpointDir)
 
     train_input_files = []
     if FLAGS.train_input_file is not None:
         for input_pattern in FLAGS.train_input_file.split(","):
-            train_input_files.extend(tf.gfile.Glob(input_pattern))
+            train_input_files.extend(tf.compat.v1.gfile.Glob(input_pattern))
 
     test_input_files = []
     if FLAGS.test_input_file is not None:
         for input_pattern in FLAGS.test_input_file.split(","):
-            test_input_files.extend(tf.gfile.Glob(input_pattern))
+            test_input_files.extend(tf.compat.v1.gfile.Glob(input_pattern))
 
-    tf.logging.info("*** Train Input Files ***")
+    tf.compat.v1.logging.info("*** Train Input Files ***")
     for input_file in train_input_files:
-        tf.logging.info("  %s" % input_file)
+        tf.compat.v1.logging.info("  %s" % input_file)
 
-    tf.logging.info("*** Test Input Files ***")
+    tf.compat.v1.logging.info("*** Test Input Files ***")
     for input_file in test_input_files:
-        tf.logging.info("  %s" % input_file)
+        tf.compat.v1.logging.info("  %s" % input_file)
 
     tpu_cluster_resolver = None
     if FLAGS.use_tpu and FLAGS.tpu_name:
-        tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
+        tpu_cluster_resolver = tf.distribute.cluster_resolver.TPUClusterResolver(
             FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
 
-    is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
-    run_config = tf.contrib.tpu.RunConfig(
+    is_per_host = tf.compat.v1.estimator.tpu.InputPipelineConfig.PER_HOST_V2
+    run_config = tf.compat.v1.estimator.tpu.RunConfig(
         cluster=tpu_cluster_resolver,
         master=FLAGS.master,
         model_dir=FLAGS.checkpointDir,
@@ -560,7 +560,7 @@ def main(_):
 
     # If TPU is not available, this will fall back to normal Estimator on CPU
     # or GPU.
-    estimator = tf.contrib.tpu.TPUEstimator(
+    estimator = tf.compat.v1.estimator.tpu.TPUEstimator(
         use_tpu=FLAGS.use_tpu,
         model_fn=model_fn,
         config=run_config,
@@ -569,8 +569,8 @@ def main(_):
         predict_batch_size=FLAGS.batch_size)
 
     if FLAGS.do_train:
-        tf.logging.info("***** Running training *****")
-        tf.logging.info("  Batch size = %d", FLAGS.batch_size)
+        tf.compat.v1.logging.info("***** Running training *****")
+        tf.compat.v1.logging.info("  Batch size = %d", FLAGS.batch_size)
         train_input_fn = input_fn_builder(
             input_files=train_input_files,
             max_seq_length=FLAGS.max_seq_length,
@@ -579,8 +579,8 @@ def main(_):
         estimator.train(input_fn=train_input_fn, max_steps=FLAGS.num_train_steps)
 
     if FLAGS.do_eval:
-        tf.logging.info("***** Running evaluation *****")
-        tf.logging.info("  Batch size = %d", FLAGS.batch_size)
+        tf.compat.v1.logging.info("***** Running evaluation *****")
+        tf.compat.v1.logging.info("  Batch size = %d", FLAGS.batch_size)
 
         eval_input_fn = input_fn_builder(
             input_files=test_input_files,
@@ -644,4 +644,4 @@ def main(_):
 if __name__ == "__main__":
     #flags.mark_flag_as_required("bert_config_file")
     #flags.mark_flag_as_required("checkpointDir")
-    tf.app.run() 
+    tf.compat.v1.app.run() 

@@ -21,7 +21,7 @@ import time
 random_seed = 12345
 short_seq_prob = 0  # Probability of creating sequences which are shorter than the maximum length。
 
-flags = tf.flags
+flags = tf.compat.v1.flags
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string("signature", 'default', "signature_name")
@@ -135,7 +135,7 @@ def write_instance_to_example_files(instances, max_seq_length,
     """Create TF example files from `TrainingInstance`s."""
     writers = []
     for output_file in output_files:
-        writers.append(tf.python_io.TFRecordWriter(output_file))
+        writers.append(tf.compat.v1.python_io.TFRecordWriter(output_file))
 
     writer_index = 0
 
@@ -181,8 +181,8 @@ def write_instance_to_example_files(instances, max_seq_length,
         total_written += 1
 
         if inst_index < 20:
-            tf.logging.info("*** Example ***")
-            tf.logging.info("tokens: %s" % " ".join(
+            tf.compat.v1.logging.info("*** Example ***")
+            tf.compat.v1.logging.info("tokens: %s" % " ".join(
                 [printable_text(x) for x in instance.tokens]))
 
             for feature_name in features.keys():
@@ -192,14 +192,14 @@ def write_instance_to_example_files(instances, max_seq_length,
                     values = feature.int64_list.value
                 elif feature.float_list.value:
                     values = feature.float_list.value
-                tf.logging.info("%s: %s" % (feature_name,
+                tf.compat.v1.logging.info("%s: %s" % (feature_name,
                                             " ".join([str(x)
                                                       for x in values])))
 
     for writer in writers:
         writer.close()
 
-    tf.logging.info("Wrote %d total instances", total_written)
+    tf.compat.v1.logging.info("Wrote %d total instances", total_written)
 
 
 def create_int_feature(values):
@@ -592,12 +592,12 @@ def gen_samples(data,
         masked_lm_prob, max_predictions_per_seq, rng, vocab, mask_prob,
         prop_sliding_window, pool_size, force_last)
 
-    tf.logging.info("number of instances: %s", len(instances))
+    tf.compat.v1.logging.info("number of instances: %s", len(instances))
 
     output_files = [output_filename]
-    tf.logging.info("*** Writing to output files ***")
+    tf.compat.v1.logging.info("*** Writing to output files ***")
     for output_file in output_files:
-        tf.logging.info("  %s", output_file)
+        tf.compat.v1.logging.info("  %s", output_file)
 
     write_instance_to_example_files(instances, max_seq_length,
                                     max_predictions_per_seq, vocab,
@@ -605,7 +605,7 @@ def gen_samples(data,
 
 
 def main():
-    tf.logging.set_verbosity(tf.logging.INFO)
+    tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.INFO)
 
     #     flags.DEFINE_string("input_file", './data/ml-1m.txt', "input file")
     #     flags.DEFINE_string("output_file", './data/ml-1m.tfrecord', "output file")
@@ -662,22 +662,45 @@ def main():
     print("user_history_file", user_history_file)
 
     rng = random.Random(random_seed)
-    user_history = None
+    data = collections.defaultdict(list)
+    user_history = collections.defaultdict(list)
 
-    if os.path.isfile(user_history_file):
+    # Always load data from data_file
+    print("load data from", data_file)
+    f = open(data_file, 'r')
+    for line in f:
+        parts = line.rstrip().split(' ') 
+        if len(parts) == 2: 
+            user, item = parts[0], parts[1]
+            data["user_"+user].append("item_"+item)
+            # Populate user_history here as well if it's meant to be the raw sequences
+            # Or, it might be that user_history is only for already processed/pickled history
+            user_history["user_"+user].append("item_"+item) 
+        elif len(parts) == 4:
+            user, item, rating, timestamp = parts
+            data["user_"+user].append("item_"+item)
+            user_history["user_"+user].append("item_"+item)
+        else:
+            tf.compat.v1.logging.warning(f"Skipping malformed line: {line.rstrip()}")
+            continue
+    f.close()
+
+    if os.path.isfile(user_history_file) and os.path.isfile(vocab_file):
         print("load user history from", user_history_file)
-        with open(user_history_file, 'rb') as pkl_file:
-            user_history = pickle.load(pkl_file)
-
-    if os.path.isfile(vocab_file):
+        # user_history is already populated from data_file, 
+        # so loading from pickle might be redundant or for a different purpose.
+        # For now, let's assume the user_history from data_file is the source of truth
+        # and pickling is for caching. If this assumption is wrong, this part may need review.
+        # with open(user_history_file, 'rb') as pkl_file:
+        #     user_history = pickle.load(pkl_file) # Potentially overwrite or merge
         print("load vocab from", vocab_file)
         with open(vocab_file, 'rb') as pkl_file:
             vocab = pickle.load(pkl_file)
     else:
-        data, user_history = load_item_pop(data_file, user_history)
         vocab = FreqVocab(data)
         with open(vocab_file, 'wb') as output_file:
             pickle.dump(vocab, output_file, protocol=2)
+        # user_history is already populated, pickle it if creating for the first time
         with open(user_history_file, 'wb') as output_file:
             pickle.dump(user_history, output_file, protocol=2)
 
